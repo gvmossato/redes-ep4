@@ -4,7 +4,7 @@
 
 import os
 
-from flask import Flask, request, make_response
+from flask import Flask, request, make_response, redirect, abort
 from flask_sqlalchemy import SQLAlchemy
 
 # ====== #
@@ -54,6 +54,9 @@ def get_header(title):
         """
     )
 
+def get_user_from_cookies():
+    return User.query.filter_by(id=request.cookies.get('user_id')).first()
+
 # =========== #
 # Controllers #
 # =========== #
@@ -65,8 +68,10 @@ def get_homepage():
         <body>
             <h1>EP4 de Redes</h1>
             <h2>Criptografia</h2>
-            <br />
-            <a href="signup">Sign Up</a>
+            <ul>
+                <li><a href="signup">Sign Up</a></li>
+                <li><a href="signin">Sign In</a></li>
+            </ul>
         </body>
         """, 200
     )
@@ -111,6 +116,94 @@ def post_signup():
     db.session.commit()
     return make_response('User created!', 201)
 
+def get_signin():
+    return make_response(
+        get_header('EP4 | Sign In') +
+        """
+        <body>
+            <h1>Sign In</h1>
+            <form action="/signin" method="post" />
+                <input name="email" id="email" placeholder="E-mail*" type="email" />
+                <br />
+                <input name="password" id="password" placeholder="Password*" type="password" />
+                <br />
+                <br />
+                <input id="submit" type="submit" value="Sign In" />
+            </form>
+            <br />
+            <a href="/">< Back</a>
+        </body>
+        """, 200
+    )
+
+def post_signin():
+    for field in request.form.keys():
+        if not request.form[field]:
+            return make_response(f'<b>{field.title()}</b> is required!', 400)
+
+    registered_user = User.query.filter_by(
+        email=request.form['email'],
+        password=request.form['password']
+    ).first()
+
+    if registered_user:
+        res = make_response(redirect('/profile'), 302)
+        res.set_cookie('user_id', str(registered_user.id))
+        return res
+
+    return make_response('User not found!', 401)
+
+def get_profile():
+    logged_user = get_user_from_cookies()
+
+    if logged_user:
+        return make_response(
+            get_header('EP4 | Profile') +
+            f"""
+            <body>
+                <h1>Profile</h1>
+                <p>Signed in as: <b>{logged_user.username}</b></p>
+                <ul>
+                    <li><a href="/">Home</a></li>
+                    <li><a href="/logout">Logout</a></li>
+                </ul>
+            </body>
+            """, 200
+        )
+
+    return abort(401, description="User not logged in!")
+
+def get_logout():
+    logged_user = get_user_from_cookies()
+
+    if logged_user:
+        return make_response(
+            get_header('EP4 | Logout') +
+            f"""
+            <body>
+                <h1>Logout</h1>
+                <p>Signed in as: <b>{logged_user.username}</b></p>
+                <p>Do you really want to logout?</p>
+                <div style="display: flex">
+                    <form action="/profile" method="get">
+                        <input type="submit" href="/profile" value="Back" />
+                    </form>
+                    <form action="/logout" method="post">
+                        <input type="submit" href="/logout" value="Logout" />
+                    </form>
+                </div>
+
+            </body>
+            """, 200
+        )
+
+    return abort(401, description="User not logged in!")
+
+def post_logout():
+    res = make_response(redirect('/'), 302)
+    res.set_cookie('user_id', '', max_age=0)
+    return res
+
 # ====== #
 # Routes #
 # ====== #
@@ -123,8 +216,23 @@ def get_landpage():
 def handle_signup():
     if request.method == 'GET': return get_signup()
     if request.method == 'POST': return post_signup()
-
     return make_response(f"Can't {request.method} /signup", 405)
+
+@app.route('/signin', methods =['GET', 'POST'])
+def handle_signin():
+    if request.method == 'GET': return get_signin()
+    if request.method == 'POST': return post_signin()
+    return make_response(f"Can't {request.method} /signin", 405)
+
+@app.route('/profile')
+def get_user():
+    return get_profile()
+
+@app.route('/logout', methods =['GET', 'POST'])
+def handle_logout():
+    if request.method == 'GET': return get_logout()
+    if request.method == 'POST': return post_logout()
+    return make_response(f"Can't {request.method} /logout", 405)
 
 # ===== #
 # Start #
