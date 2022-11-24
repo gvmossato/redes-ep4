@@ -73,8 +73,6 @@ def get_header(title):
 def get_user_from_cookies():
     curr_session_id = request.cookies.get('session_id')
 
-    print(curr_session_id)
-
     if curr_session_id:
         curr_session = Session.query.filter_by(id=curr_session_id).first()
         user = User.query.filter_by(id=curr_session.user_id).first()
@@ -113,11 +111,13 @@ def create_session(user_id):
 
     res = make_response(redirect('/profile'), 302)
     res.set_cookie('session_id', session_id)
+
+    print('\nUsuário logado:')
+    print('ID da sessão:', session_id, end='\n\n')
     return res
 
 def init_kdf(salt=None):
     if salt is None: salt = os.urandom(SALT_SIZE)
-
     return (
         Scrypt(
             salt=salt, # Secret
@@ -183,8 +183,6 @@ def post_signup():
     kdf, salt = init_kdf()
     digest = kdf.derive(request.form['password'].encode('utf-8'))
 
-    print('types', type(digest), type(salt))
-
     db.session.add(User(
         username=request.form['username'],
         email=request.form['email'],
@@ -192,6 +190,10 @@ def post_signup():
     ))
     db.session.commit()
 
+    print('\nUsuário cadastrado:')
+    print('i)   Senha original:', request.form['password'])
+    print('ii)  Sal:', salt.hex(), '| Digest:', digest.hex())
+    print('iii) Salvo no banco:', bytearr_to_b64(salt + digest), end='\n\n')
     return make_response('User created!', 201)
 
 def get_signin():
@@ -233,7 +235,6 @@ def post_signin():
 
         if is_correct_password(kdf, sent_password_bytes, stored_digest):
             return create_session(str(registered_user.id))
-
     return make_response('User not found!', 401)
 
 def get_profile():
@@ -253,7 +254,6 @@ def get_profile():
             </body>
             """, 200
         )
-
     return abort(401, description="User not logged in!")
 
 def get_logout():
@@ -279,7 +279,6 @@ def get_logout():
             </body>
             """, 200
         )
-
     return abort(401, description="User not logged in!")
 
 def post_logout():
