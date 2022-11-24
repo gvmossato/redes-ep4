@@ -4,12 +4,20 @@
 
 import os
 
+from hashlib import md5
+from base64 import b64encode, b64decode
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidKey
+
 from flask import Flask, request, make_response, redirect, abort
 from flask_sqlalchemy import SQLAlchemy
 
 # ====== #
 # Config #
 # ====== #
+
+# App & DB
 
 app = Flask(__name__)
 basedir = os.path.abspath(os.path.dirname(__file__))
@@ -23,15 +31,23 @@ app.config.update(
 db = SQLAlchemy(app)
 debug = True
 
+SALT_SIZE = 16 # Ideally, this should be in .env
+SESSION_ID_SIZE = 16
+
 # ===== #
 # Model #
 # ===== #
 
 class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(140), unique=True, nullable=False)
-    email = db.Column(db.String(140), unique=True, nullable=False)
-    password = db.Column(db.String(140), nullable=False)
+    id       = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String, unique=True, nullable=False)
+    email    = db.Column(db.String, unique=True, nullable=False)
+    password = db.Column(db.String, nullable=False)
+
+class Session(db.Model):
+    id         = db.Column(db.String, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey(User.id), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=db.func.current_timestamp())
 
 with app.app_context():
     db.create_all()
@@ -55,7 +71,63 @@ def get_header(title):
     )
 
 def get_user_from_cookies():
-    return User.query.filter_by(id=request.cookies.get('user_id')).first()
+    curr_session_id = request.cookies.get('session_id')
+
+    print(curr_session_id)
+
+    if curr_session_id:
+        curr_session = Session.query.filter_by(id=curr_session_id).first()
+        user = User.query.filter_by(id=curr_session.user_id).first()
+
+        user_last_session = Session.query.filter_by(user_id=user.id)          \
+                                         .order_by(Session.created_at.desc()) \
+                                         .first()
+
+        if user_last_session.id == curr_session_id:
+            return user
+    return
+
+def bytearr_to_b64(bytearr):
+    return b64encode(bytearr).decode('ascii')
+
+def b64_to_bytearr(b64):
+    return b64decode(b64.encode('ascii'))
+
+def is_correct_password(kdf, password_bytes, digest):
+    try:
+        kdf.verify(password_bytes, digest)
+        return True
+    except InvalidKey:
+        return False
+
+def create_session(user_id):
+    session_id = bytearr_to_b64(md5(os.urandom(SESSION_ID_SIZE)).digest())
+
+    db.session.add(
+        Session(
+            id=session_id,
+            user_id=user_id
+        )
+    )
+    db.session.commit()
+
+    res = make_response(redirect('/profile'), 302)
+    res.set_cookie('session_id', session_id)
+    return res
+
+def init_kdf(salt=None):
+    if salt is None: salt = os.urandom(SALT_SIZE)
+
+    return (
+        Scrypt(
+            salt=salt, # Secret
+            length=32, # Derived key desired length
+            n=2**14,   # CPU and Memory cost parameter
+            r=8,       # Blocksize parameter
+            p=1,       # Parallelization parameter
+            backend=default_backend()
+        ), salt
+    )
 
 # =========== #
 # Controllers #
@@ -108,12 +180,18 @@ def post_signup():
     if same_username_user or same_email_user:
         return make_response('User already exists!', 400)
 
+    kdf, salt = init_kdf()
+    digest = kdf.derive(request.form['password'].encode('utf-8'))
+
+    print('types', type(digest), type(salt))
+
     db.session.add(User(
         username=request.form['username'],
         email=request.form['email'],
-        password=request.form['password']
+        password=bytearr_to_b64(salt + digest)
     ))
     db.session.commit()
+
     return make_response('User created!', 201)
 
 def get_signin():
@@ -143,13 +221,18 @@ def post_signin():
 
     registered_user = User.query.filter_by(
         email=request.form['email'],
-        password=request.form['password']
     ).first()
 
     if registered_user:
-        res = make_response(redirect('/profile'), 302)
-        res.set_cookie('user_id', str(registered_user.id))
-        return res
+        stored_hash_bytes = b64_to_bytearr(registered_user.password)
+        stored_salt = stored_hash_bytes[:SALT_SIZE]
+        stored_digest = stored_hash_bytes[SALT_SIZE:]
+        sent_password_bytes = request.form['password'].encode('utf-8')
+
+        kdf, _ = init_kdf(stored_salt)
+
+        if is_correct_password(kdf, sent_password_bytes, stored_digest):
+            return create_session(str(registered_user.id))
 
     return make_response('User not found!', 401)
 
@@ -201,7 +284,7 @@ def get_logout():
 
 def post_logout():
     res = make_response(redirect('/'), 302)
-    res.set_cookie('user_id', '', max_age=0)
+    res.set_cookie('session_id', '', max_age=0)
     return res
 
 # ====== #
