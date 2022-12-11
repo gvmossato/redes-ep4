@@ -3,9 +3,13 @@
 # ==== #
 
 import os
+import json
 
 from hashlib import md5
 from base64 import b64encode, b64decode
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidKey
@@ -31,8 +35,9 @@ app.config.update(
 db = SQLAlchemy(app)
 debug = True
 
-SALT_SIZE = 16 # Ideally, this should be in .env
+SALT_SIZE = 16
 SESSION_ID_SIZE = 16
+KEY_SIZE = 16
 
 # ===== #
 # Model #
@@ -51,6 +56,43 @@ class Session(db.Model):
 
 with app.app_context():
     db.create_all()
+
+# ============ #
+# Cryptography #
+# ============ #
+
+class HMAC:
+    def __init__(self, mac=None):
+        self.mac = os.urandom(KEY_SIZE) if mac is None else mac
+        self.hmac = hmac.HMAC(self.mac, hashes.SHA256())
+
+    def execute(self, message, finalize=True):
+        self.hmac.update(message)
+        if finalize:
+            return self.hmac.finalize()
+
+    def verify(self, signature):
+        self.hmac.verify(signature)
+
+class AES:
+    def __init__(self, key=None, iv=None):
+        self.key = os.urandom(KEY_SIZE) if key is None else key
+        self.iv = os.urandom(KEY_SIZE) if iv is None else iv
+
+        cipher = Cipher(
+            algorithms.AES(self.key),
+            modes.CTR(self.iv),
+            backend=default_backend()
+        )
+
+        self.encryptor = cipher.encryptor()
+        self.decryptor = cipher.decryptor()
+
+    def encrypt(self, message):
+        return self.encryptor.update(message) + self.encryptor.finalize()
+
+    def decrypt(self, message):
+        return self.decryptor.update(message) + self.decryptor.finalize()
 
 # ===== #
 # Utils #
@@ -86,10 +128,10 @@ def get_user_from_cookies():
     return
 
 def bytearr_to_b64(bytearr):
-    return b64encode(bytearr).decode('ascii')
+    return b64encode(bytearr).decode('utf-8')
 
 def b64_to_bytearr(b64):
-    return b64decode(b64.encode('ascii'))
+    return b64decode(b64.encode('utf-8'))
 
 def is_correct_password(kdf, password_bytes, digest):
     try:
@@ -128,6 +170,17 @@ def init_kdf(salt=None):
             backend=default_backend()
         ), salt
     )
+
+def extract_signin_data(data):
+    keys = b64_to_bytearr(data['session_keys'])
+    key = keys[: KEY_SIZE]
+    mac = keys[KEY_SIZE : 2*KEY_SIZE]
+    iv  = keys[2*KEY_SIZE :]
+
+    ct = b64_to_bytearr(data['cyphertext'])
+    sig = b64_to_bytearr(data['hmac'])
+    return key, mac, iv, ct, sig
+
 
 # =========== #
 # Controllers #
@@ -217,19 +270,32 @@ def get_signin():
     )
 
 def post_signin():
-    for field in request.form.keys():
-        if not request.form[field]:
+    key, mac, iv, cyphertext, signature = extract_signin_data(
+        json.loads(request.data)
+    )
+
+    hmac_manager = HMAC(mac)
+    hmac_manager.execute(cyphertext, finalize=False)
+    hmac_manager.verify(signature)
+
+    aes_manager = AES(key, iv)
+    credentials = json.loads(
+        aes_manager.decrypt(cyphertext).decode('utf-8')
+    )
+
+    for field in credentials.keys():
+        if not credentials[field]:
             return make_response(f'<b>{field.title()}</b> is required!', 400)
 
     registered_user = User.query.filter_by(
-        email=request.form['email'],
+        email=credentials['email'],
     ).first()
 
     if registered_user:
         stored_hash_bytes = b64_to_bytearr(registered_user.password)
         stored_salt = stored_hash_bytes[:SALT_SIZE]
         stored_digest = stored_hash_bytes[SALT_SIZE:]
-        sent_password_bytes = request.form['password'].encode('utf-8')
+        sent_password_bytes = credentials['password'].encode('utf-8')
 
         kdf, _ = init_kdf(stored_salt)
 

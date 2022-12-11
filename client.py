@@ -15,11 +15,11 @@ from base64 import b64encode
 def get_cmd_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-u",
-        "--username",
+        "-e",
+        "--email",
         type=str,
         required=True,
-        help="registered client username"
+        help="registered client email"
     )
     parser.add_argument(
         "-p",
@@ -37,23 +37,25 @@ def bytearr_to_b64(bytearr):
 # Cryptography #
 # ============ #
 
-KEY_SIZE = 32
-
+KEY_SIZE = 16
 
 class HMAC:
-    def __init__(self):
-        self.mac = os.urandom(KEY_SIZE)
+    def __init__(self, mac=None):
+        self.mac = os.urandom(KEY_SIZE) if mac is None else mac
         self.hmac = hmac.HMAC(self.mac, hashes.SHA256())
 
-    def apply(self, message: bytes):
+    def execute(self, message, finalize=True):
         self.hmac.update(message)
-        return self.hmac.finalize()
+        if finalize:
+            return self.hmac.finalize()
 
+    def verify(self, signature):
+        self.hmac.verify(signature)
 
 class AES:
-    def __init__(self):
-        self.key = os.urandom(KEY_SIZE)
-        self.iv = os.urandom(KEY_SIZE)
+    def __init__(self, key=None, iv=None):
+        self.key = os.urandom(KEY_SIZE) if key is None else key
+        self.iv = os.urandom(KEY_SIZE) if iv is None else iv
 
         cipher = Cipher(
             algorithms.AES(self.key),
@@ -64,13 +66,11 @@ class AES:
         self.encryptor = cipher.encryptor()
         self.decryptor = cipher.decryptor()
 
-    def encrypt(self, message: bytes):
-        self.encryptor.update(message)
-        return self.encryptor.finalize()
+    def encrypt(self, message):
+        return self.encryptor.update(message) + self.encryptor.finalize()
 
-    def decrypt(self, message: bytes):
-        self.decryptor.update(message)
-        return self.decryptor.finalize()
+    def decrypt(self, message):
+        return self.decryptor.update(message) + self.decryptor.finalize()
 
 # ====== #
 # Script #
@@ -78,39 +78,34 @@ class AES:
 
 cmd_args = get_cmd_args()
 credentials = json.dumps({
-    'username' : cmd_args.username,
+    'email' : cmd_args.email,
     'password' : cmd_args.password
 })
 
 aes_manager = AES()
 hmac_manager = HMAC()
 
-session_keys = bytearr_to_b64(
-    aes_manager.key  +
-    hmac_manager.mac +
-    aes_manager.iv
-)
-cyphertext = bytearr_to_b64(
-    aes_manager.encrypt(credentials.encode('utf-8'))
-)
-hmac_b64 = bytearr_to_b64(
-    hmac_manager.apply(cyphertext)
-)
+session_keys = aes_manager.key + hmac_manager.mac + aes_manager.iv
+cyphertext = aes_manager.encrypt(credentials.encode('utf-8'))
+signature = hmac_manager.execute(cyphertext)
+
+payload = {
+    'session_keys': bytearr_to_b64(session_keys),
+    'cyphertext'  : bytearr_to_b64(cyphertext),
+    'hmac'        : bytearr_to_b64(signature),
+}
 
 res = requests.post(
-    'http://localhost:5000/login',
-    data={
-        'session_keys' : session_keys,
-        'cyphertext'   : cyphertext,
-        'hmac'         : hmac_b64,
-    }
+    'http://localhost:5000/signin',
+    headers={ 'Content-Type': 'application/json' },
+    data=json.dumps(payload)
 )
 
+print('\nConteúdo da requisição:', payload, sep='\n')
+
 if res.status_code == 200:
-    print('\nLogin bem sucedido:')
-    print('Status code:', res.status_code)
-    print('ID da sessão:', res.cookies['session_id'])
+    print(f'\n[{res.status_code}] Login bem sucedido:')
+    print('ID da sessão:', res.request._cookies.get('session_id'), end='\n\n')
 else:
-    print(f'\nResposta inesperada:')
-    print('Status code:', res.status_code)
-    print(res.json())
+    print(f'\n[{res.status_code}] Resposta inesperada:')
+    print(res.json(), end='\n\n')
