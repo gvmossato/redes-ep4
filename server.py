@@ -4,12 +4,14 @@
 
 import os
 import json
+import requests
 
 from hashlib import md5
 from base64 import b64encode, b64decode
 
+from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives import hashes, hmac, serialization
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidKey
@@ -75,7 +77,7 @@ class HMAC:
         self.hmac.verify(signature)
 
 class AES:
-    def __init__(self, key=None, iv=None):
+    def __init__(self, key, iv):
         self.key = os.urandom(KEY_SIZE) if key is None else key
         self.iv = os.urandom(KEY_SIZE) if iv is None else iv
 
@@ -93,6 +95,97 @@ class AES:
 
     def decrypt(self, message):
         return self.decryptor.update(message) + self.decryptor.finalize()
+
+class KeySerializer:
+    def __init__(self, public_key_path, private_key_path=None):
+        self.public_key_path = public_key_path
+        self.private_key_path = private_key_path
+
+    def _read_public(self):
+        with open(self.public_key_path, "rb") as public_key_file_object:
+            public_key = serialization.load_pem_public_key(
+                public_key_file_object.read(),
+                backend=default_backend()
+            )
+        return public_key
+
+    def _read_private(self):
+        with open(self.private_key_path, "rb") as private_key_file_object:
+            private_key = serialization.load_pem_private_key(
+                private_key_file_object.read(),
+                backend=default_backend(),
+                password=None
+            )
+        return private_key
+
+    def read(self, which):
+        readers = {
+            'public' : self._read_public,
+            'private' : self._read_private,
+        }
+        return readers[which]()
+
+class Transmission:
+    def __init__(
+            self,
+            server_public_key,
+            server_private_key=None,
+            aes_key=None,
+            mac=None,
+            iv=None,
+        ):
+        self.server_public_key = server_public_key
+        self.server_private_key = server_private_key
+
+        self.aes = AES(key=aes_key, iv=iv)
+        self.sym_hmac = HMAC(
+            mac=self.server_public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
+        self.assym_hmac = HMAC(mac=mac)
+
+    def send(self, message_bytes):
+        sym_keys = self.aes.key + self.aes.iv + self.assym_hmac.mac
+
+        session_keys = self.server_public_key.encrypt(
+            sym_keys,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        cyphertext = self.aes.encrypt(message_bytes)
+        signature = self.assym_hmac.execute(session_keys + cyphertext)
+
+        payload = {
+            'session_keys': bytearr_to_b64(session_keys),
+            'cyphertext'  : bytearr_to_b64(cyphertext),
+            'hmac'        : bytearr_to_b64(signature),
+        }
+
+        print('\nConteúdo da requisição:')
+        print(payload)
+
+        return requests.post(
+            'http://localhost:5000/signin',
+            headers={ 'Content-Type': 'application/octet-stream' },
+            data=json.dumps(payload).encode('utf-8')
+        )
+
+    def verify(self, received_bytes):
+        session_keys = received_bytes['session_keys']
+        cyphertext = received_bytes['cyphertext']
+        signature = received_bytes['hmac']
+
+        self.assym_hmac.execute(session_keys + cyphertext, finalize=False)
+        self.assym_hmac.verify(signature)
+        return
+
+    def receive(self, cyphertext):
+        return json.loads(self.aes.decrypt(cyphertext).decode('utf-8'))
 
 # ===== #
 # Utils #
@@ -171,15 +264,20 @@ def init_kdf(salt=None):
         ), salt
     )
 
-def extract_signin_data(data):
-    keys = b64_to_bytearr(data['session_keys'])
-    key = keys[: KEY_SIZE]
-    mac = keys[KEY_SIZE : 2*KEY_SIZE]
-    iv  = keys[2*KEY_SIZE :]
+def decrypt_session_keys(cipher_keys, server_private_key):
+    session_keys = server_private_key.decrypt(
+        cipher_keys,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
 
-    ct = b64_to_bytearr(data['cyphertext'])
-    sig = b64_to_bytearr(data['hmac'])
-    return key, mac, iv, ct, sig
+    aes_key = session_keys[: KEY_SIZE]
+    aes_iv = session_keys[KEY_SIZE : 2*KEY_SIZE]
+    assym_mac = session_keys[2*KEY_SIZE :]
+    return aes_key, aes_iv, assym_mac
 
 
 # =========== #
@@ -270,18 +368,31 @@ def get_signin():
     )
 
 def post_signin():
-    key, mac, iv, cyphertext, signature = extract_signin_data(
-        json.loads(request.data)
+    data = json.loads(request.data.decode('utf-8'))
+    for key, val in data.items():
+        data[key] = b64_to_bytearr(val)
+
+    key_serializer = KeySerializer(
+        public_key_path='./keys/rsa.public.pem',
+        private_key_path='./keys/rsa.private.pem',
+    )
+    server_public_key = key_serializer.read('public')
+    server_private_key = key_serializer.read('private')
+
+    aes_key, aes_iv, assym_mac = decrypt_session_keys(
+        data['session_keys'],
+        server_private_key
     )
 
-    hmac_manager = HMAC(mac)
-    hmac_manager.execute(cyphertext, finalize=False)
-    hmac_manager.verify(signature)
-
-    aes_manager = AES(key, iv)
-    credentials = json.loads(
-        aes_manager.decrypt(cyphertext).decode('utf-8')
+    transmission = Transmission(
+        server_public_key=server_public_key,
+        server_private_key=server_private_key,
+        aes_key=aes_key,
+        iv=aes_iv,
+        mac=assym_mac
     )
+    transmission.verify(data)
+    credentials = transmission.receive(data['cyphertext'])
 
     for field in credentials.keys():
         if not credentials[field]:

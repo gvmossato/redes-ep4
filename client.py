@@ -127,14 +127,19 @@ class Transmission:
         self.server_private_key = server_private_key
 
         self.aes = AES(key=aes_key, iv=iv)
-        self.sym_hmac = HMAC(mac=self.server_public_key)
+        self.sym_hmac = HMAC(
+            mac=self.server_public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
         self.assym_hmac = HMAC(mac=mac)
 
     def send(self, message_bytes):
-        sym_keys = self.aes.key + self.aes.iv
+        sym_keys = self.aes.key + self.aes.iv + self.assym_hmac.mac
 
         session_keys = self.server_public_key.encrypt(
-            sym_keys + self.sym_hmac.execute(sym_keys),
+            sym_keys,
             padding.OAEP(
                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
                 algorithm=hashes.SHA256(),
@@ -148,13 +153,28 @@ class Transmission:
             'session_keys': bytearr_to_b64(session_keys),
             'cyphertext'  : bytearr_to_b64(cyphertext),
             'hmac'        : bytearr_to_b64(signature),
-        }.encode('utf-8')
+        }
+
+        print('\nConteúdo da requisição:')
+        print(payload)
 
         return requests.post(
             'http://localhost:5000/signin',
             headers={ 'Content-Type': 'application/octet-stream' },
-            data=payload
+            data=json.dumps(payload).encode('utf-8')
         )
+
+    def verify(self, received_bytes):
+        session_keys = received_bytes['session_keys']
+        cyphertext = received_bytes['cyphertext']
+        signature = received_bytes['hmac']
+
+        self.assym_hmac.execute(session_keys + cyphertext, finalize=False)
+        self.assym_hmac.verify(signature)
+        return
+
+    def receive(self, cyphertext):
+        return json.loads(self.aes.decrypt(cyphertext).decode('utf-8'))
 
 # ====== #
 # Script #
